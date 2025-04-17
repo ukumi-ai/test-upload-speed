@@ -350,138 +350,156 @@ const FileUploadComponent: React.FC<FileUploadComponentProps> = ({
   };
 
   // Initiate upload for a single file
-  // Initiate upload for a single file
-  const uploadFile = async (fileItem: FileWithStatus): Promise<string> => {
-    const file = fileItem.file;
-    const videoSource = fileItem.videoSource;
+// Initiate upload for a single file with parallel chunk uploading
+const uploadFile = async (fileItem: FileWithStatus): Promise<string> => {
+  const file = fileItem.file;
+  const videoSource = fileItem.videoSource;
+  const PARALLEL_UPLOADS = 10; // Number of chunks to upload in parallel
 
-    try {
-      // Update file status to uploading
-      updateFileProgress(fileItem.id, 0, FileStatus.UPLOADING);
+  try {
+    // Update file status to uploading
+    updateFileProgress(fileItem.id, 0, FileStatus.UPLOADING);
 
-      // Clean the filename for S3
-      const cleanedFileName = cleanFileName(file.name);
+    // Clean the filename for S3
+    const cleanedFileName = cleanFileName(file.name);
 
-      // Calculate part count
-      const partCount = Math.ceil(file.size / CHUNK_SIZE);
+    // Calculate part count
+    const partCount = Math.ceil(file.size / CHUNK_SIZE);
 
-      console.log("Initiating upload with params:", {
-        action: "initUpload",
-        videoSource,
-        uploadType,
-        fileName: cleanedFileName,
-        contentType: file.type,
-        partCount,
-      });
+    console.log("Initiating upload with params:", {
+      action: "initUpload",
+      videoSource,
+      uploadType,
+      fileName: cleanedFileName,
+      contentType: file.type,
+      partCount,
+    });
 
-      // Initiate upload
-      const initiateResponse = await axios.post("/api/upload", {
-        action: "initUpload",
-        videoSource,
-        uploadType,
-        fileName: cleanedFileName,
-        contentType: file.type,
-        partCount,
-      });
+    // Initiate upload
+    const initiateResponse = await axios.post("/api/upload", {
+      action: "initUpload",
+      videoSource,
+      uploadType,
+      fileName: cleanedFileName,
+      contentType: file.type,
+      partCount,
+    });
 
-      console.log("Initiate response:", initiateResponse.data);
+    console.log("Initiate response:", initiateResponse.data);
 
-      const { uploadId, key, urls } = initiateResponse.data;
+    const { uploadId, key, urls } = initiateResponse.data;
 
-      // Upload parts
-      const uploadedParts: { ETag: string; PartNumber: number }[] = [];
+    // Upload parts in parallel batches
+    const uploadedParts: { ETag: string; PartNumber: number }[] = [];
+    let completedChunks = 0;
 
-      for (let i = 0; i < partCount; i++) {
+    // Process chunks in batches of PARALLEL_UPLOADS
+    for (let batchStart = 0; batchStart < partCount; batchStart += PARALLEL_UPLOADS) {
+      const batchEnd = Math.min(batchStart + PARALLEL_UPLOADS, partCount);
+      const batchPromises = [];
+
+      // Create batch of upload promises
+      for (let i = batchStart; i < batchEnd; i++) {
         const start = i * CHUNK_SIZE;
         const end = Math.min(file.size, (i + 1) * CHUNK_SIZE);
         const chunkData = file.slice(start, end);
+        const partNumber = i + 1;
 
-        try {
-          const uploadResponse = await axios.put(urls[i], chunkData, {
-            headers: {
-              "Content-Type": "application/octet-stream",
-              // Add any other necessary headers for S3
-            },
-          });
-
-          // Properly extract ETag (removing quotes if necessary)
+        const uploadPromise = axios.put(urls[i], chunkData, {
+          headers: {
+            "Content-Type": "application/octet-stream",
+          },
+        })
+        .then(uploadResponse => {
+          // Extract ETag (removing quotes if necessary)
           let etag = uploadResponse.headers.etag;
           if (etag) {
             // Remove quotes if they exist
             etag = etag.replace(/"/g, "");
           } else {
-            console.error(
-              "No ETag found in response headers",
-              uploadResponse.headers
-            );
+            console.error("No ETag found in response headers", uploadResponse.headers);
             throw new Error("No ETag found in response");
           }
 
-          uploadedParts.push({
-            ETag: etag,
-            PartNumber: i + 1,
-          });
-
-          // Update progress
-          const progress = Math.round(((i + 1) / partCount) * 100);
+          // Track completed chunk
+          completedChunks++;
+          
+          // Update progress (safely handle potential race conditions)
+          const progress = Math.round((completedChunks / partCount) * 100);
           updateFileProgress(fileItem.id, progress);
-        } catch (error) {
-          console.error(`Failed to upload part ${i + 1}:`, error);
-          // Try to abort the upload before throwing
-          try {
-            await axios.post("/api/upload", {
-              action: "abortUpload",
-              videoSource,
-              uploadType,
-              uploadId,
-              key,
-            });
-            console.log("Upload aborted due to part failure");
-          } catch (abortError) {
-            console.error("Failed to abort upload:", abortError);
-          }
-          throw error;
+
+          return {
+            ETag: etag,
+            PartNumber: partNumber,
+          };
+        });
+
+        batchPromises.push(uploadPromise);
+      }
+
+      try {
+        // Wait for the current batch to complete
+        const batchResults = await Promise.all(batchPromises);
+        uploadedParts.push(...batchResults);
+      } catch (error) {
+        console.error(`Failed to upload batch starting at ${batchStart}:`, error);
+        
+        // Try to abort the upload before throwing
+        try {
+          await axios.post("/api/upload", {
+            action: "abortUpload",
+            videoSource,
+            uploadType,
+            uploadId,
+            key,
+          });
+          console.log("Upload aborted due to batch failure");
+        } catch (abortError) {
+          console.error("Failed to abort upload:", abortError);
         }
+        
+        throw error;
       }
-
-      console.log("All parts uploaded, completing upload with:", {
-        action: "completeUpload",
-        videoSource,
-        uploadType,
-        uploadId,
-        key,
-        parts: uploadedParts,
-      });
-
-      // Complete the upload
-      const completeResponse = await axios.post("/api/upload", {
-        action: "completeUpload",
-        videoSource,
-        uploadType,
-        uploadId,
-        key,
-        parts: uploadedParts.sort((a, b) => a.PartNumber - b.PartNumber),
-      });
-
-      console.log("Complete response:", completeResponse.data);
-
-      const { url } = completeResponse.data;
-
-      // Update file with completed status and url
-      updateFileProgress(fileItem.id, 100, FileStatus.COMPLETED, url);
-
-      return url;
-    } catch (error) {
-      console.error("Upload error:", error);
-      if (axios.isAxiosError(error)) {
-        console.error("Response data:", error.response?.data);
-        console.error("Response status:", error.response?.status);
-        console.error("Response headers:", error.response?.headers);
-      }
-      updateFileProgress(fileItem.id, fileItem.progress, FileStatus.ERROR);
-      throw error;
     }
-  };
+
+    console.log("All parts uploaded, completing upload with:", {
+      action: "completeUpload",
+      videoSource,
+      uploadType,
+      uploadId,
+      key,
+      parts: uploadedParts,
+    });
+
+    // Complete the upload
+    const completeResponse = await axios.post("/api/upload", {
+      action: "completeUpload",
+      videoSource,
+      uploadType,
+      uploadId,
+      key,
+      parts: uploadedParts.sort((a, b) => a.PartNumber - b.PartNumber),
+    });
+
+    console.log("Complete response:", completeResponse.data);
+
+    const { url } = completeResponse.data;
+
+    // Update file with completed status and url
+    updateFileProgress(fileItem.id, 100, FileStatus.COMPLETED, url);
+
+    return url;
+  } catch (error) {
+    console.error("Upload error:", error);
+    if (axios.isAxiosError(error)) {
+      console.error("Response data:", error.response?.data);
+      console.error("Response status:", error.response?.status);
+      console.error("Response headers:", error.response?.headers);
+    }
+    updateFileProgress(fileItem.id, fileItem.progress, FileStatus.ERROR);
+    throw error;
+  }
+};
 
   // Start uploading all files
   const startUpload = async (): Promise<void> => {
